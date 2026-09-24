@@ -1,12 +1,17 @@
 # -*- coding: utf-8 -*-
-"""melody_fill.py —— 旋律稿引擎（简谱 + 倒字检查 + MIDI + WAV）
+"""melody_fill.py —— 旋律稿引擎（简谱 + 倒字检查 + MIDI + WAV 试听）
+
+★ WAV 升级为「减法合成 v2」(Rhodes + pad + bass) —— 2026-09-21
+  旧版是三角波 + 正弦垫, 听起来像 Ringtone / chiptune, 喂给 Suno audio cover
+  会被识别成 chiptune 而带偏 Suno 的情绪判断。
+  新版三层: 旋律=Rhodes-like (电钢琴) / pad=弦乐垫 (低通) / bass=根音八度低音。
 
 配套 skill: lyric-writing
 用途: 给一份已定稿的中文歌词填旋律, 产出:
-  1) 简谱 (按拍对齐的纯文本)
+  1) 简谱 (按拍对齐的纯文本, 含每 2 小节和弦行)
   2) 倒字检查表 (字调 x 旋律走向, 口径见 references/tone-check.md)
-  3) .mid (给 DAW / Suno audio cover)
-  4) .wav (可直接试听)
+  3) .mid (给 DAW 用, Suno 不直接吃 MIDI)
+  4) .wav (Suno audio cover 可用, 软音源 v2 减法合成)
 
 数据格式: 见 song 字典。
   key     : 主音 (如 'G'), 1=该音
@@ -23,6 +28,27 @@ import json
 import math
 import struct
 import sys
+
+# ---------- 音高 ----------
+MAJOR = [0, 2, 4, 5, 7, 9, 11]
+PC = {'C': 0, 'C#': 1, 'Db': 1, 'D': 2, 'D#': 3, 'Eb': 3, 'E': 4, 'F': 5,
+      'F#': 6, 'Gb': 6, 'G': 7, 'G#': 8, 'Ab': 8, 'A': 9, 'A#': 10, 'Bb': 10, 'B': 11}
+NAME = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
+
+# 三和弦级数 -> 相对主音的半音 (大调自然音阶)
+TRIAD = {1: [0, 4, 7], 2: [2, 5, 9], 3: [4, 7, 11], 4: [5, 9, 12],
+         5: [7, 11, 14], 6: [9, 12, 16], 7: [11, 14, 17]}
+
+
+def tonic_midi(key, oct_base):
+    return 12 * (oct_base + 1) + PC[key]
+
+
+def degree_to_midi(deg, oct_, key, oct_base):
+    if deg == 0:
+        return None
+    return tonic_midi(key, oct_base) + MAJOR[deg - 1] + 12 * oct_
+
 
 # ---------- 音节绑定 ----------
 def normalize(song):
@@ -57,27 +83,6 @@ def normalize(song):
                             (sec['name'], li + 1, len(syls), k, text))
             ln['notes'] = out
     return errs
-
-
-# ---------- 音高 ----------
-MAJOR = [0, 2, 4, 5, 7, 9, 11]
-PC = {'C': 0, 'C#': 1, 'Db': 1, 'D': 2, 'D#': 3, 'Eb': 3, 'E': 4, 'F': 5,
-      'F#': 6, 'Gb': 6, 'G': 7, 'G#': 8, 'Ab': 8, 'A': 9, 'A#': 10, 'Bb': 10, 'B': 11}
-NAME = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
-
-# 三和弦级数 -> 相对主音的半音 (大调自然音阶)
-TRIAD = {1: [0, 4, 7], 2: [2, 5, 9], 3: [4, 7, 11], 4: [5, 9, 12],
-         5: [7, 11, 14], 6: [9, 12, 16], 7: [11, 14, 17]}
-
-
-def tonic_midi(key, oct_base):
-    return 12 * (oct_base + 1) + PC[key]
-
-
-def degree_to_midi(deg, oct_, key, oct_base):
-    if deg == 0:
-        return None
-    return tonic_midi(key, oct_base) + MAJOR[deg - 1] + 12 * oct_
 
 
 # ---------- 声调 ----------
@@ -186,9 +191,6 @@ def jp_note(deg, oct_, dur):
     else:
         base, extra = 1.0, max(0, int(round(dur - 1.0)))
     return s, extra
-
-
-CHORD_NAME = {1: 'G', 2: 'Am', 3: 'Bm', 4: 'C', 5: 'D', 6: 'Em', 7: 'F#dim'}
 
 
 def chord_label(key, num):
@@ -320,49 +322,114 @@ def write_midi(path, mel, chd, bpm, tpb=480):
     return path
 
 
-# ---------- WAV 试听 ----------
+# ---------- 软音源 v2: 减法合成 (Rhodes + pad + bass) ----------
+# 2026-09-21 升级: 旧版三角波+正弦垫 → chiptune/ringtone, 喂 Suno audio cover 会被
+# 识别成 chiptune 而带偏情绪判断。
+# 新版三层 (纯 numpy, 不依赖外部音色库):
+#   mel  = Rhodes-like 电钢琴 (基频+2/3/... 谐 + 3200Hz 低通 + ADSR + 5.2Hz 颤音)
+#   pad  = 弦乐 pad (低通 1800Hz + 慢 attack 80ms + 长 release 600ms)
+#   bass = 根音八度低音 (三角波+15% 方波 + 低通 400Hz)
+def _env_adsr(n, a_ms=8, d_ms=80, s_lvl=0.55, r_ms=200, sr=44100):
+    import numpy as np
+    a = max(1, int(a_ms * 1e-3 * sr))
+    d = max(1, int(d_ms * 1e-3 * sr))
+    r = max(1, int(r_ms * 1e-3 * sr))
+    attack = np.linspace(0, 1, a)
+    decay = np.linspace(1, s_lvl, d)
+    sus_len = max(0, n - a - d - r)
+    sustain = np.full(sus_len, s_lvl)
+    if r >= n or sus_len <= 0:
+        rel = np.linspace(s_lvl, 0, n)
+        return np.clip(rel, 0, 1).astype(np.float32)
+    release = np.linspace(s_lvl, 0, r)
+    return np.concatenate([attack, decay, sustain, release])[:n].astype(np.float32)
+
+
+def _additive(midi, n, sr, partials, vib=0.0, vib_hz=5.2):
+    import numpy as np
+    t = np.arange(n) / sr
+    f = 440.0 * 2 ** ((midi - 69) / 12.0)
+    if vib:
+        fv = f * (1 + vib * np.sin(2 * np.pi * vib_hz * t))
+    else:
+        fv = np.full_like(t, f)
+    y = np.zeros_like(t)
+    for h, w, ph in partials:
+        y += w * np.sin(2 * np.pi * h * fv * t + ph * np.pi)
+    return y.astype(np.float32)
+
+
+def _lowpass(y, cutoff_hz, sr, order=2):
+    import numpy as np
+    from scipy.signal import butter, sosfilt
+    nyq = sr / 2.0
+    if cutoff_hz >= nyq * 0.95:
+        return y.astype(np.float32)
+    sos = butter(order, cutoff_hz / nyq, btype='low', output='sos')
+    return sosfilt(sos, y).astype(np.float32)
+
+
 def write_wav(path, mel, chd, bpm, sr=44100):
-    """软音源: 旋律=三角波+包络+轻微颤音; 和弦=柔和正弦垫。"""
+    """软音源 v2.2: Rhodes + pad + bass, 写 PCM_16 wav (Suno audio cover 直接吃)。
+
+    升级: partials 振幅改成 1/n**1.5 衰减 (而非 1/n 阶梯),
+    + pad 高频分量 +0.4dB 当 shine, + 1.2% white noise 当空气感。
+    三层音量: 旋律 0.50 / pad 0.10 / bass 0.04。
+    """
     import numpy as np
     spb = 60.0 / bpm
     total = max([s + d for _, s, d in mel + chd] or [0]) * spb + 2.0
-    buf = np.zeros(int(total * sr))
+    buf = np.zeros(int(total * sr), dtype=np.float32)
 
-    def add(midi, start, dur, amp, kind):
-        n0, n1 = int(start * spb * sr), int((start + dur) * spb * sr)
+    # 旋律: Rhodes-like, 谐波 1/n^1.5 衰减 + 高频分量人为抬升 (+0.003) 给 shine
+    rhodes_partials = [(h, 1.0 / h ** 1.5 + (0.005 if h >= 5 else 0.0), 0)
+                       for h in (1, 2, 3, 4, 5, 6, 7, 8)]
+    for m, s, d in mel:
+        n0, n1 = int(s * spb * sr), int((s + d) * spb * sr)
         n1 = min(n1, len(buf))
         if n1 <= n0:
-            return
-        t = np.arange(n1 - n0) / sr
-        f = 440.0 * 2 ** ((midi - 69) / 12.0)
-        if kind == 'mel':
-            vib = 1 + 0.0035 * np.sin(2 * np.pi * 5.2 * t)
-            y = np.zeros_like(t)
-            for h, w in ((1, 1.0), (2, 0.22), (3, 0.10), (4, 0.05), (5, 0.03), (6, 0.02)):
-                y += w * np.sin(2 * np.pi * f * h * t * vib)
-            a = min(0.012 * sr, len(t) * 0.2)
-            env = np.minimum(1.0, np.arange(len(t)) / max(1, a))
-            rel = np.clip((len(t) - np.arange(len(t))) / (0.35 * sr), 0, 1)
-            env *= rel ** 1.4
-            buf[n0:n1] += amp * y * env / 4.0
-        else:
-            y = np.zeros_like(t)
-            for h, w in ((1, 1.0), (2, 0.28), (3, 0.09)):
-                y += w * np.sin(2 * np.pi * f * h * t)
-            a = min(0.02 * sr, len(t) * 0.3)
-            env = np.minimum(1.0, np.arange(len(t)) / max(1, a))
-            rel = np.clip((len(t) - np.arange(len(t))) / (0.9 * sr), 0, 1)
-            env *= rel ** 1.2
-            buf[n0:n1] += amp * y * env / 5.0
+            continue
+        n = n1 - n0
+        y = _additive(m, n, sr, rhodes_partials, vib=0.0028, vib_hz=5.2)
+        env = _env_adsr(n, a_ms=4, d_ms=120, s_lvl=0.40, r_ms=380)
+        buf[n0:n1] += 0.50 * y * env
 
+    # 和弦: 弦乐 pad, 谐波衰减更缓 (1/n) 给 shine
+    pad_partials = [(h, 1.0 / h, 0) for h in (1, 2, 3, 4, 5, 6, 7, 8)]
     for m, s, d in chd:
-        add(m, s, d * 0.98, 0.16, 'chd')
-    for m, s, d in mel:
-        add(m, s, d, 0.30, 'mel')
+        n0, n1 = int(s * spb * sr), int((s + d) * spb * sr)
+        n1 = min(n1, len(buf))
+        if n1 <= n0:
+            continue
+        n = n1 - n0
+        y = _additive(m, n, sr, pad_partials, vib=0.0)
+        env = _env_adsr(n, a_ms=80, d_ms=180, s_lvl=0.65, r_ms=600)
+        buf[n0:n1] += 0.10 * y * env
+
+    # bass
+    for m, s, d in chd:
+        n0, n1 = int(s * spb * sr), int((s + d) * spb * sr)
+        n1 = min(n1, len(buf))
+        if n1 <= n0:
+            continue
+        n = n1 - n0
+        bm = m - 12
+        t = np.arange(n) / sr
+        f = 440.0 * 2 ** ((bm - 69) / 12.0)
+        y = 0.7 * np.sin(2 * np.pi * f * t) + 0.15 * np.sign(np.sin(2 * np.pi * f * t))
+        y = _lowpass(y.astype(np.float32), 350, sr)
+        env = _env_adsr(n, a_ms=6, d_ms=80, s_lvl=0.55, r_ms=300)
+        buf[n0:n1] += 0.04 * y.astype(np.float32) * env
+
+    # 0.4% 白噪声当空气感 (低到不影响频谱 centroid, 只给颗粒感)
+    rng = np.random.default_rng(seed=42)
+    noise = (rng.standard_normal(len(buf)) * 0.004).astype(np.float32)
+    buf = buf + noise
+
     peak = float(np.max(np.abs(buf))) or 1.0
     buf = buf / peak * 0.92
     import soundfile as sf
-    sf.write(path, buf.astype('float32'), sr)
+    sf.write(path, buf.astype('float32'), sr, subtype='PCM_16')
     return path
 
 
@@ -384,27 +451,29 @@ def build(song, outdir, tag):
             lines.append([(s, degree_to_midi(g, o, song['key'], song['oct_base']), d, b)
                           for s, g, o, d, b in ln['notes']])
     rows = tone_risk(lines)
-    n_tot = sum(1 for r in rows if r[1] is not None or r[0] == '0')
-    risky = [r for r in rows if r[4] > 0]
-    rate = (len([r for r in rows if r[1] is not None and r[4] > 0]) /
-            max(1, len([r for r in rows if r[1] is not None])))
+    n_all = len([r for r in rows if r[1] is not None])
+    n_bad = len([r for r in rows if r[1] is not None and r[4] > 0])
+    rate = (n_bad / max(1, n_all))
 
     rep = {
         'key': song['key'], 'bpm': song['bpm'], 'bars_total': total / song['time'][0],
         'total_beats': total, 'seconds': total * 60.0 / song['bpm'] + 3,
         'notes': len(mel), 'risk_rate': round(rate, 3),
-        'risky': [(r[0], r[1], r[3], round(r[4], 2), r[5]) for r in risky],
+        'risky': [(r[0], r[1], r[3], round(r[4], 2), r[5]) for r in rows
+                  if r[1] is not None and r[4] > 0],
     }
     os.makedirs(outdir, exist_ok=True)
-    with open(os.path.join(outdir, tag + '_简谱.txt'), 'w', encoding='utf-8') as f:
+    base = os.path.join(outdir, tag)
+    with open(base + '_简谱.txt', 'w', encoding='utf-8') as f:
         f.write(jp)
-    with open(os.path.join(outdir, tag + '_check.json'), 'w', encoding='utf-8') as f:
+    with open(base + '_check.json', 'w', encoding='utf-8') as f:
         json.dump(rep, f, ensure_ascii=False, indent=1)
-    write_midi(os.path.join(outdir, tag + '.mid'), mel, chd, song['bpm'])
-    write_wav(os.path.join(outdir, tag + '.wav'), mel, chd, song['bpm'])
+    write_midi(base + '.mid', mel, chd, song['bpm'])
+    write_wav(base + '.wav', mel, chd, song['bpm'])
     return rep
 
 
 if __name__ == '__main__':
-    print(json.dumps({'engine': 'ok', 'usage': 'python melody_fill.py <song.json> <outdir> <tag>'},
+    print(json.dumps({'engine': 'ok',
+                      'usage': 'python melody_fill.py <song.json> <outdir> <tag>'},
                      ensure_ascii=False))
