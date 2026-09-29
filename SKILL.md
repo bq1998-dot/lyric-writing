@@ -20,7 +20,7 @@ license: MIT
 agent_created: true
 compatibility: Agent Skills 开放标准（agentskills.io）。Claude Code / Codex / OpenCode / Hermes Agent / OpenClaw / Cursor 等均可使用。
 metadata:
-  version: "1.40.0"
+  version: "1.41.0"
   agent_created: "true"
   updated: "2026-09-28"
 ---
